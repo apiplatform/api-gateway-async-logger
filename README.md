@@ -107,25 +107,12 @@ Make sure to define 2 shared dictionaries:
 * `lua_shared_dict stats_kinesis 16m;` - dictionary used to buffer the logs in memory 
 * `lua_shared_dict aws_credentials 1m;` - dictionary used to cache any IAM and STS credentials 
 
-In the `init_worker_by_lua` add the following function useful for reusing the same logger instance on each worker process:
+Then in the `log_by_lua` configure the logger to send the information:
 ```lua
+local cjson = require "cjson"
 local logger_factory = require "api-gateway.logger.factory"
-local function get_logger(name, logger_module, logger_opts)
-    -- try to reuse an existing instance
-    if (logger_factory:hasLogger(name)) then
-        return logger_factory:getLogger(name)
-    end
 
-    -- create a new instance of the logger
-    return logger_factory:getLogger(name, logger_module, logger_opts)
-end
-
-ngx.get_logger = get_logger
-```
-
-Then in the `log_by_lua` configure the logger send the information:
-```lua
-    local cjson = require "cjson"
+local function get_logger_configuration()
     local logger_module = "api-gateway.logger.BufferedAsyncLogger"
     local logger_opts = {
         flush_length = 500,          -- http://docs.aws.amazon.com/kinesis/latest/APIReference/API_PutRecords.html - 500 is max
@@ -151,20 +138,33 @@ Then in the `log_by_lua` configure the logger send the information:
             -- status.threads_pending - how many threads are waiting to be executed
         end
     }
+    return logger_module, logger_opts
+end    
+
+local function get_logger(name)
+    -- try to reuse an existing logger instance for each worker process
+    if (logger_factory:hasLogger(name)) then
+        return logger_factory:getLogger(name)
+    end
     
-    local kinesis_logger = ngx.get_logger("kinesis-logger", logger_module, logger_opts)
+    -- create a new logger instance
+    local logger_module , logger_opts = get_logger_configuration()
+    return logger_factory:getLogger(name, logger_module, logger_opts)
+end
     
-    local partition_key = ngx.utctime() .."-".. math.random(ngx.now() * 1000)
-    local kinesis_data = {}
-    
-    -- add any information you want to capture
-    kinesis_data["http_referer"] = ngx.var.http_referer
-    kinesis_data["user_agent"] = ngx.var.http_user_agent
-    kinesis_data["hostname"] = ngx.var.hostname
-    kinesis_data["http_host"] = ngx.var.host
-    
-    -- at the end log the message
-    kinesis_logger:logMetrics( partition_key, cjson.encode(kinesis_data))
+local kinesis_logger = get_logger("kinesis-logger")
+
+local partition_key = ngx.utctime() .."-".. math.random(ngx.now() * 1000)
+local kinesis_data = {}
+
+-- add any information you want to capture
+kinesis_data["http_referer"] = ngx.var.http_referer
+kinesis_data["user_agent"] = ngx.var.http_user_agent
+kinesis_data["hostname"] = ngx.var.hostname
+kinesis_data["http_host"] = ngx.var.host
+
+-- at the end log the message
+kinesis_logger:logMetrics( partition_key, cjson.encode(kinesis_data))
 ```
 
 If you want to use STS Credentials instead of IAM Credentials with the Kinesis Logger then configure the `backend_opts.aws_credentials` as follows:
@@ -179,14 +179,15 @@ aws_credentials = {
 
 Make sure to also configure the NGINX variables:
 
-* `kinesis_aws_account` - the AWS Account where the kinesis stream is
+* `kinesis_aws_account` - the AWS Account where the kinesis stream is configured
 * `kinesis_iam_role` - the role to be assumed in order to send the logs to kinesis
+
 >INFO: If you send the logs into the same account where NGINX runs you don't need to configure any STS Credentials, but you can use IAM Credentials. 
 
 For more information about `AWSSTSCredentials` configuration see [the documentation](https://github.com/adobe-apiplatform/api-gateway-aws#sts-credentials).
 
 If you can't use IAM Credentials nor STS Credentials, then you can still send logs to Kinesis by configuring AWS with static `access_key` and `secret`.
- These are not as secure as IAM/STS but work for non-AWS deployments:
+ These are not as secure as IAM/STS but are working for non-AWS deployments:
 
 ```lua
 aws_credentials = {
